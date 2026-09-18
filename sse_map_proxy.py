@@ -104,6 +104,20 @@ def _map_chunk(data):
     return mod
 
 
+def _grab_providers(data, sink):
+    """Collect OpenRouter-style provider failover attempts for logging."""
+    try:
+        for attempt in (data["choices"][0]["delta"]["provider_metadata"]
+                        ["gateway"]["routing"]["modelAttempts"]):
+            for pa in attempt.get("providerAttempts", []):
+                rec = "%s:%s:%s" % (pa.get("provider"), pa.get("success"),
+                                    pa.get("statusCode"))
+                if rec not in sink:
+                    sink.append(rec)
+    except (KeyError, IndexError, TypeError):
+        pass
+
+
 def _aggregate(raw):
     """Collapse an SSE body into one chat.completion JSON object."""
     content, reasoning, tool_calls = [], [], []
@@ -149,7 +163,7 @@ def _aggregate(raw):
                     slot["function"]["arguments"] += fn["arguments"]
             if choice.get("finish_reason"):
                 finish = choice["finish_reason"]
-    message = {"role": "assistant", "content": "".join(content)}
+    message: dict = {"role": "assistant", "content": "".join(content)}
     if reasoning:
         message["reasoning_content"] = "".join(reasoning)
     if tool_calls:
@@ -198,7 +212,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # ------------------------------------------------------------------ post
     def do_POST(self):
         route, up_host, up_path = self._route()
-        if route is None:
+        if route is None or up_host is None or up_path is None:
             self.send_error(404)
             return
         t0 = time.time()
@@ -302,6 +316,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         buf = b""
         sent = 0
         got_done = False
+        providers = []
         try:
             while True:
                 chunk = resp.read1(65536)
@@ -314,6 +329,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if line.startswith(b"data: ") and line[6:].strip() != b"[DONE]":
                         try:
                             data = json.loads(line[6:].decode("utf-8"))
+                            _grab_providers(data, providers)
                             if _map_chunk(data):
                                 line = b"data: " + json.dumps(data, ensure_ascii=False).encode("utf-8")
                         except Exception:
@@ -342,11 +358,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 pass
             conn.close()
-        print("%s [%s] done=%s sent=%d elapsed=%.1fs" % (
-            _now(), route, got_done, sent, time.time() - t0), file=sys.stderr)
+        print("%s [%s] done=%s sent=%d elapsed=%.1fs providers=%s" % (
+            _now(), route, got_done, sent, time.time() - t0,
+            ",".join(providers) or "-"), file=sys.stderr)
 
     # -------------------------------------------------------------- plumbing
-    def log_message(self, fmt, *args):
+    def log_message(self, format, *args):  # noqa: A002 (stdlib signature)
         pass
 
     def handle_one_request(self):
