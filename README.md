@@ -27,6 +27,14 @@ Stdlib only — no dependencies. Python ≥ 3.8.
   - merges minimal placeholder `bash` / `read` tools into the request's `tools`
     array (the gate only checks the names and count, not the schemas),
   - forces `"stream": true` upstream.
+- **Responses bridge**: models whose name starts with `muse-` (e.g.
+  `muse-spark-1.3-contributor-free`) are only served on the Responses API.
+  For those, the proxy translates the incoming `chat.completions` request into
+  a `/zen/v1/responses` request (messages → `instructions` + `input` items,
+  tools → Responses-format tools, placeholder `bash`/`read` injection) and
+  translates the SSE events back into `chat.completion.chunk` deltas —
+  including text, reasoning summaries and `function_call` → `tool_calls`.
+  Non-stream clients get the aggregated JSON.
 - Proper HTTP/1.1 chunked framing, keep-alive safe, thread-per-connection.
 
 ## Quick start

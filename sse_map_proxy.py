@@ -44,6 +44,8 @@ ZEN_HOST = "opencode.ai"
 ZEN_UA = "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14"
 ZEN_SESSION = "ses_f4df4cb3bffetj5bTDp2vZHLRH"
 ZEN_REQUEST_ID = "msg_0b20bce72001HhNaOVex180aKz"
+ZEN_RESPONSES_PATH = "/zen/v1/responses"
+RESPONSES_MODEL_PREFIXES = ("muse-",)
 PLACEHOLDER_DESC = "Placeholder tool required by upstream gateway. Never invoke this tool."
 
 UPSTREAM_TIMEOUT = 300
@@ -176,6 +178,198 @@ def _aggregate(raw):
     return json.dumps(out, ensure_ascii=False).encode("utf-8")
 
 
+def _flatten_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") in ("text", "input_text", "output_text"):
+                parts.append(part.get("text") or "")
+            elif isinstance(part, str):
+                parts.append(part)
+        return "".join(parts)
+    return "" if content is None else str(content)
+
+
+def _chat_to_responses(payload):
+    """Translate an OpenAI chat.completions request into a Responses API request."""
+    out = {"model": payload.get("model"), "stream": True}
+    instructions = []
+    inputs = []
+    for msg in payload.get("messages") or []:
+        role = msg.get("role")
+        text = _flatten_text(msg.get("content"))
+        if role == "system":
+            if text:
+                instructions.append(text)
+        elif role == "user":
+            inputs.append({"role": "user",
+                           "content": [{"type": "input_text", "text": text}]})
+        elif role == "assistant":
+            if text:
+                inputs.append({"role": "assistant",
+                               "content": [{"type": "output_text", "text": text}]})
+            for tc in msg.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                inputs.append({"type": "function_call",
+                               "call_id": tc.get("id") or "",
+                               "name": fn.get("name") or "",
+                               "arguments": fn.get("arguments") or ""})
+        elif role == "tool":
+            inputs.append({"type": "function_call_output",
+                           "call_id": msg.get("tool_call_id") or "",
+                           "output": text})
+    if instructions:
+        out["instructions"] = "\n\n".join(instructions)
+    out["input"] = inputs
+
+    tools = []
+    names = set()
+    for tool in payload.get("tools") or []:
+        fn = tool.get("function") or {}
+        name = fn.get("name")
+        if not name:
+            continue
+        tools.append({"type": "function", "name": name,
+                      "description": fn.get("description") or "",
+                      "parameters": fn.get("parameters") or {"type": "object", "properties": {}}})
+        names.add(name)
+    added = []
+    for name in ("bash", "read"):
+        if name not in names:
+            tools.append({"type": "function", "name": name,
+                          "description": PLACEHOLDER_DESC,
+                          "parameters": {"type": "object", "properties": {}, "required": []}})
+            added.append(name)
+    out["tools"] = tools
+    return out, added
+
+
+def _new_state(model):
+    return {"id": None, "created": None, "model": model or "", "role_sent": False,
+            "finish_sent": False, "tc_index": {}, "n_tc": 0}
+
+
+def _chat_chunk(state, delta=None, finish=None, usage=None):
+    out = {"id": state.get("id") or "", "object": "chat.completion.chunk",
+           "created": state.get("created") or 0, "model": state.get("model") or "",
+           "choices": [{"index": 0, "delta": delta or {}, "finish_reason": finish}]}
+    if usage:
+        out["usage"] = usage
+    return out
+
+
+def _responses_event_chunks(evt, state):
+    """Translate one Responses API SSE event into chat.completion.chunk dicts."""
+    etype = evt.get("type")
+    resp = evt.get("response") or {}
+    chunks = []
+    if resp:
+        if resp.get("id"):
+            state["id"] = resp["id"]
+        if resp.get("created_at"):
+            state["created"] = resp["created_at"]
+        if resp.get("model"):
+            state["model"] = resp["model"]
+    if not state["role_sent"] and etype in ("response.created", "response.in_progress",
+                                            "response.output_text.delta"):
+        state["role_sent"] = True
+        chunks.append(_chat_chunk(state, delta={"role": "assistant"}))
+    if etype == "response.output_text.delta":
+        chunks.append(_chat_chunk(state, delta={"content": evt.get("delta") or ""}))
+    elif etype == "response.reasoning_summary_text.delta":
+        chunks.append(_chat_chunk(state, delta={"reasoning_content": evt.get("delta") or ""}))
+    elif etype == "response.output_item.added":
+        item = evt.get("item") or {}
+        if item.get("type") == "function_call":
+            idx = state["n_tc"]
+            state["n_tc"] += 1
+            for key in (item.get("call_id"), item.get("id")):
+                if key:
+                    state["tc_index"][key] = idx
+            chunks.append(_chat_chunk(state, delta={"tool_calls": [{
+                "index": idx, "id": item.get("call_id") or "", "type": "function",
+                "function": {"name": item.get("name") or "", "arguments": ""}}]}))
+    elif etype == "response.function_call_arguments.delta":
+        idx = state["tc_index"].get(evt.get("item_id") or "", 0)
+        chunks.append(_chat_chunk(state, delta={"tool_calls": [{
+            "index": idx, "function": {"arguments": evt.get("delta") or ""}}]}))
+    elif etype == "response.completed":
+        usage = resp.get("usage") or {}
+        chat_usage = None
+        if usage:
+            chat_usage = {"prompt_tokens": usage.get("input_tokens", 0),
+                          "completion_tokens": usage.get("output_tokens", 0),
+                          "total_tokens": usage.get("total_tokens", 0)}
+        finish = "tool_calls" if state["n_tc"] else "stop"
+        chunks.append(_chat_chunk(state, delta={}, finish=finish, usage=chat_usage))
+        state["finish_sent"] = True
+    elif etype == "error":
+        chunks.append({"error": evt.get("error") or evt})
+    return chunks
+
+
+def _aggregate_chat_chunks(chunks):
+    content, reasoning, tool_calls = [], [], []
+    finish = None
+    rid = created = model = usage = None
+    for ch in chunks:
+        rid = ch.get("id") or rid
+        created = ch.get("created") or created
+        model = ch.get("model") or model
+        if ch.get("usage"):
+            usage = ch["usage"]
+        for choice in ch.get("choices", []):
+            delta = choice.get("delta") or {}
+            if delta.get("content"):
+                content.append(delta["content"])
+            if delta.get("reasoning_content"):
+                reasoning.append(delta["reasoning_content"])
+            for tc in delta.get("tool_calls") or []:
+                idx = tc.get("index", 0)
+                while len(tool_calls) <= idx:
+                    tool_calls.append({"id": "", "type": "function",
+                                       "function": {"name": "", "arguments": ""}})
+                slot = tool_calls[idx]
+                if tc.get("id"):
+                    slot["id"] = tc["id"]
+                if tc.get("type"):
+                    slot["type"] = tc["type"]
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    slot["function"]["name"] += fn["name"]
+                if fn.get("arguments"):
+                    slot["function"]["arguments"] += fn["arguments"]
+            if choice.get("finish_reason"):
+                finish = choice["finish_reason"]
+    message: dict = {"role": "assistant", "content": "".join(content)}
+    if reasoning:
+        message["reasoning_content"] = "".join(reasoning)
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    out = {"id": rid or "", "object": "chat.completion", "created": created or 0,
+           "model": model or "",
+           "choices": [{"index": 0, "message": message, "finish_reason": finish or "stop"}]}
+    if usage:
+        out["usage"] = usage
+    return json.dumps(out, ensure_ascii=False).encode("utf-8")
+
+
+def _responses_events(raw):
+    for line in raw.split(b"\n"):
+        line = line.strip()
+        if not line.startswith(b"data: "):
+            continue
+        payload = line[6:]
+        if payload.strip() == b"[DONE]":
+            continue
+        try:
+            yield json.loads(payload.decode("utf-8"))
+        except Exception:
+            continue
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "sse-map-proxy/1.0"
@@ -220,21 +414,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
         raw_body = self.rfile.read(length) if length else b""
 
         req_model, want_stream, added, n_tools, body = "?", True, [], 0, raw_body
+        responses_mode = False
         try:
             payload = json.loads(raw_body)
             req_model = payload.get("model", "?")
             want_stream = payload.get("stream") is not False
             if route == "zen":
-                added = _ensure_zen_tools(payload)
-                payload["stream"] = True
-                n_tools = len(payload.get("tools") or [])
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                if isinstance(req_model, str) and req_model.startswith(RESPONSES_MODEL_PREFIXES):
+                    conv, added = _chat_to_responses(payload)
+                    body = json.dumps(conv, ensure_ascii=False).encode("utf-8")
+                    n_tools = len(conv.get("tools") or [])
+                    responses_mode = True
+                else:
+                    added = _ensure_zen_tools(payload)
+                    payload["stream"] = True
+                    n_tools = len(payload.get("tools") or [])
+                    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            else:
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         except Exception as exc:
             print("%s [%s] BAD-REQ %s" % (_now(), route, exc), file=sys.stderr)
 
-        print("%s [%s] REQ model=%s len=%d stream=%s tools=%d added=%s" % (
+        print("%s [%s] REQ model=%s len=%d stream=%s tools=%d added=%s%s" % (
             _now(), route, req_model, len(body), want_stream, n_tools,
-            ",".join(added) or "-"), file=sys.stderr)
+            ",".join(added) or "-", " via=responses" if responses_mode else ""))
         if self.dump_dir:
             try:
                 if not os.path.isdir(self.dump_dir):
@@ -260,6 +463,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                        if k.lower() not in HOP_BY_HOP}
             headers["Accept-Encoding"] = "identity"
 
+        if responses_mode:
+            up_path = ZEN_RESPONSES_PATH
+
         try:
             conn = http.client.HTTPSConnection(up_host, timeout=UPSTREAM_TIMEOUT,
                                                context=ssl.create_default_context())
@@ -282,7 +488,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raw = resp.read()
             out_ctype = ctype or "application/json"
             if resp.status < 400 and "text/event-stream" in ctype:
-                raw = _aggregate(raw)
+                if responses_mode:
+                    rstate = _new_state(req_model if isinstance(req_model, str) else "")
+                    chunks = []
+                    for evt in _responses_events(raw):
+                        chunks.extend(_responses_event_chunks(evt, rstate))
+                    raw = _aggregate_chat_chunks(chunks)
+                else:
+                    raw = _aggregate(raw)
                 out_ctype = "application/json"
             else:
                 try:
@@ -317,6 +530,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         sent = 0
         got_done = False
         providers = []
+        rstate = _new_state(req_model if isinstance(req_model, str) else "")
         try:
             while True:
                 chunk = resp.read1(65536)
@@ -326,21 +540,44 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
                     line = line.rstrip(b"\r")
-                    if line.startswith(b"data: ") and line[6:].strip() != b"[DONE]":
-                        try:
-                            data = json.loads(line[6:].decode("utf-8"))
-                            _grab_providers(data, providers)
-                            if _map_chunk(data):
-                                line = b"data: " + json.dumps(data, ensure_ascii=False).encode("utf-8")
-                        except Exception:
-                            pass
-                    data_line = line + b"\n"
-                    self.wfile.write(b"%x\r\n%s\r\n" % (len(data_line), data_line))
-                    self.wfile.flush()
-                    sent += len(data_line)
-                    if line.startswith(b"data: [DONE]"):
-                        got_done = True
-            if buf:
+                    out_lines = []
+                    if responses_mode:
+                        if line.startswith(b"data: ") and line[6:].strip():
+                            try:
+                                evt = json.loads(line[6:].decode("utf-8"))
+                            except Exception:
+                                evt = None
+                            if evt is not None:
+                                for out_chunk in _responses_event_chunks(evt, rstate):
+                                    out_lines.append(b"data: " + json.dumps(
+                                        out_chunk, ensure_ascii=False).encode("utf-8"))
+                                if rstate["finish_sent"] and not got_done:
+                                    out_lines.append(b"data: [DONE]")
+                                    got_done = True
+                    else:
+                        if line.startswith(b"data: ") and line[6:].strip() != b"[DONE]":
+                            try:
+                                data = json.loads(line[6:].decode("utf-8"))
+                                _grab_providers(data, providers)
+                                if _map_chunk(data):
+                                    line = b"data: " + json.dumps(data, ensure_ascii=False).encode("utf-8")
+                            except Exception:
+                                pass
+                        out_lines.append(line)
+                        if line.startswith(b"data: [DONE]"):
+                            got_done = True
+                    for out_line in out_lines:
+                        data_line = out_line + b"\n"
+                        self.wfile.write(b"%x\r\n%s\r\n" % (len(data_line), data_line))
+                        self.wfile.flush()
+                        sent += len(data_line)
+            if responses_mode and not got_done:
+                data_line = b"data: [DONE]\n"
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(data_line), data_line))
+                self.wfile.flush()
+                sent += len(data_line)
+                got_done = True
+            if buf and not responses_mode:
                 data_line = buf.rstrip(b"\r") + b"\n"
                 self.wfile.write(b"%x\r\n%s\r\n" % (len(data_line), data_line))
                 self.wfile.flush()
