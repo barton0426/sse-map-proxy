@@ -567,12 +567,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         if line.startswith(b"data: [DONE]"):
                             got_done = True
                     for out_line in out_lines:
-                        data_line = out_line + b"\n"
+                        data_line = out_line + (b"\n\n" if responses_mode else b"\n")
                         self.wfile.write(b"%x\r\n%s\r\n" % (len(data_line), data_line))
                         self.wfile.flush()
                         sent += len(data_line)
             if responses_mode and not got_done:
-                data_line = b"data: [DONE]\n"
+                data_line = b"data: [DONE]\n\n"
                 self.wfile.write(b"%x\r\n%s\r\n" % (len(data_line), data_line))
                 self.wfile.flush()
                 sent += len(data_line)
