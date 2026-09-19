@@ -34,7 +34,9 @@ Stdlib only — no dependencies. Python ≥ 3.8.
   tools → Responses-format tools, placeholder `bash`/`read` injection) and
   translates the SSE events back into `chat.completion.chunk` deltas —
   including text, reasoning summaries and `function_call` → `tool_calls`.
-  Non-stream clients get the aggregated JSON.
+  Non-stream clients get the aggregated JSON. Chat fields
+  `max_tokens` / `temperature` / `top_p` / `tool_choice` / `parallel_tool_calls`
+  are mapped onto the Responses request and `store` is set to `false`.
 - Proper HTTP/1.1 chunked framing, keep-alive safe, thread-per-connection.
 
 ## Quick start

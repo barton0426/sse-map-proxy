@@ -223,6 +223,15 @@ def _chat_to_responses(payload):
     if instructions:
         out["instructions"] = "\n\n".join(instructions)
     out["input"] = inputs
+    out["store"] = False
+    for src, dst in (("max_tokens", "max_output_tokens"),
+                     ("temperature", "temperature"),
+                     ("top_p", "top_p"),
+                     ("parallel_tool_calls", "parallel_tool_calls")):
+        if payload.get(src) is not None:
+            out[dst] = payload[src]
+    if isinstance(payload.get("tool_choice"), str):
+        out["tool_choice"] = payload["tool_choice"]
 
     tools = []
     names = set()
