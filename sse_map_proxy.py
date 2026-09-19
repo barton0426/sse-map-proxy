@@ -17,9 +17,9 @@ What it does
 * Aggregates an SSE stream into a single JSON ``chat.completion`` when the
   client asked for ``stream: false``.
 * For the zen route, rewrites the request so it passes OpenCode's free-tier
-  gate: sets ``User-Agent: opencode/...``, a valid ``x-opencode-session`` and
-  injects minimal placeholder ``bash`` / ``read`` tools (merging with any
-  client-supplied tools).
+  gate: sets ``User-Agent: opencode/...``, a valid ``x-opencode-session``,
+  session-affinity headers and injects minimal placeholder ``bash`` / ``read``
+  tools (merging with any client-supplied tools).
 
 Usage
 -----
@@ -465,6 +465,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "x-opencode-project": "global",
                 "x-opencode-session": ZEN_SESSION,
                 "x-opencode-request": ZEN_REQUEST_ID,
+                "x-session-affinity": ZEN_SESSION,
+                "X-Session-Id": ZEN_SESSION,
                 "Accept-Encoding": "identity",
             }
         else:
