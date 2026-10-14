@@ -6,7 +6,7 @@ two routes:
 | Route | Upstream | Job |
 |---|---|---|
 | `POST /v1/chat/completions` | `api.cline.bot/api/v1/chat/completions` | request passthrough + response mapping |
-| `POST /zen/v1/chat/completions` | `opencode.ai/zen/v1/chat/completions` | request shaping + response mapping |
+| `POST /zen/v1/chat/completions` | `opencode.ai/inference/openai/v1/chat/completions` | request shaping + response mapping |
 | `GET /health` | – | liveness probe |
 
 Stdlib only — no dependencies. Python ≥ 3.8.
@@ -21,17 +21,24 @@ Stdlib only — no dependencies. Python ≥ 3.8.
   stream is collapsed into a single JSON `chat.completion` object.
 - **Zen free-tier shaping**: the Opencode zen free tier rejects requests that do
   not look like they come from the OpenCode CLI. For the `/zen/...` route the
-  proxy:
-  - sets `User-Agent: opencode/<semver>` and a valid `x-opencode-session`
-    (`ses_` + 12 lowercase hex + 14 base62 chars),
-  - merges minimal placeholder `bash` / `read` tools into the request's `tools`
-    array (the gate only checks the names and count, not the schemas),
-  - forces `"stream": true` upstream.
+  proxy (updated for the 2026-10-14 gate):
+  - posts to the inference backend (`/inference/openai/v1/*`) and sends
+    `Authorization: Bearer public` (required since 2026-10-14),
+  - sets the `opencode/<channel>/<version>/<name>` User-Agent shape
+    (e.g. `opencode/latest/2.0.29/cli`) and both session headers
+    (`x-opencode-session` + `x-opencode-session-id`, same descending-encoded id);
+    the legacy `x-opencode-request` header is no longer sent (it now 403s),
+  - forces `"stream": true` plus `stream_options.include_usage`,
+  - makes the tool list read as an agent session: the genuine OpenCode core tool
+    definitions (`shell`/`edit`/`glob`/`grep`/`read`) are embedded and injected,
+    and same-named client tools are rewritten to the official definition — the
+    gate validates description + schema byte-for-byte, so stubs are rejected.
 - **Responses bridge**: models whose name starts with `muse-` (e.g.
   `muse-spark-1.3-contributor-free`) are only served on the Responses API.
   For those, the proxy translates the incoming `chat.completions` request into
-  a `/zen/v1/responses` request (messages → `instructions` + `input` items,
-  tools → Responses-format tools, placeholder `bash`/`read` injection) and
+  a `/inference/openai/v1/responses` request (messages → `instructions` +
+  `input` items, tools → Responses-format tools with the same genuine core
+  definitions) and
   translates the SSE events back into `chat.completion.chunk` deltas —
   including text, reasoning summaries and `function_call` → `tool_calls`.
   Non-stream clients get the aggregated JSON. Chat fields
@@ -75,25 +82,37 @@ curl -s http://127.0.0.1:3457/health
 
 ## Notes on the zen free tier
 
-The rules below were verified empirically (2026-09) against
-`https://opencode.ai/zen/v1/chat/completions`:
+The rules below were verified empirically (2026-10-15) against
+`https://opencode.ai/inference/openai/v1/chat/completions`:
 
-1. `User-Agent` must contain `opencode/<semver>` (≥ 1.18.0).
-2. `x-opencode-session` must be a syntactically valid session id
-   (`ses_` + 12 lowercase hex + 14 `[0-9A-Za-z]`), no freshness check observed.
-3. Body must have `"stream": true`.
-4. `tools` must contain **both** `bash` and `read` (schemas/descriptions are not
-   validated; extra tools are fine).
+1. `Authorization: Bearer public` is **required** (an absent header used to pass;
+   the check is case-sensitive — `Bearer PUBLIC` returns 401).
+2. `User-Agent` must use the `opencode/<channel>/<version>/<name>` shape
+   (e.g. `opencode/latest/2.0.29/cli`); the older
+   `opencode/<version> (<os> <arch>; <runtime>)` form is rejected.
+3. Both `x-opencode-session` and `x-opencode-session-id` must carry the same
+   descending-encoded session id (`ses_` + 12 hex ending in `ffe` + 14 base62).
+4. The legacy `x-opencode-request` header must **not** be sent (403), and
+   `x-opencode-project` must not be a canonical `prj_*` id (`global` or a bare
+   40-hex value is fine).
+5. Body must have `"stream": true` (plus `stream_options.include_usage`).
+6. `tools` must contain the genuine core tool definitions
+   (`shell`/`edit`/`glob`/`grep`/`read`); the gate validates the description and
+   JSON schema of every recognised tool, so stubs and renamed tools 403.
 
-`Authorization` is not required for the free models. This is an anti-abuse gate
-and may change at any time — if it does, adjust `ZEN_*` constants and
-`_ensure_zen_tools()` in the script.
+The old `/zen` origin now only serves the anonymous model listing
+(`GET https://opencode.ai/zen/v1/models` with `Bearer public`); the inference
+backend has no `/v1/models` (404). This is an anti-abuse gate and may change at
+any time — if it does, adjust the `ZEN_*` constants and `_ensure_zen_tools()` /
+`_zen_tools_for_responses()` in the script. Reference implementation:
+`jasonxu114514/opencode2api` (commit `0204ca1f`, 2026-10-14).
 
 ### Caveat
 
-The injected `bash` / `read` tools are placeholders. A model may still decide to
-*emit* a tool call for them; most non-OpenCode clients have no executor for
-those names. Use the zen route for chat-style traffic.
+The injected `shell` / `edit` / `glob` / `grep` / `read` tools are the genuine
+OpenCode definitions, not stubs. A model may still decide to *emit* a tool call
+for them; most non-OpenCode clients have no executor for those names. Use the
+zen route for chat-style traffic.
 
 ## Debugging
 

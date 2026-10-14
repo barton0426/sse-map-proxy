@@ -5,7 +5,7 @@ Single instance, path-based routing:
 
   POST /v1/chat/completions      -> https://api.cline.bot/api/v1/chat/completions
                                     (request passthrough, response mapping)
-  POST /zen/v1/chat/completions  -> https://opencode.ai/zen/v1/chat/completions
+  POST /zen/v1/chat/completions  -> https://opencode.ai/inference/openai/v1/chat/completions
                                     (request shaping + response mapping)
   GET  /health                   -> {"ok": true, ...}
 
@@ -17,9 +17,14 @@ What it does
 * Aggregates an SSE stream into a single JSON ``chat.completion`` when the
   client asked for ``stream: false``.
 * For the zen route, rewrites the request so it passes OpenCode's free-tier
-  gate: sets ``User-Agent: opencode/...``, a valid ``x-opencode-session``,
-  session-affinity headers and injects minimal placeholder ``bash`` / ``read``
-  tools (merging with any client-supplied tools).
+  gate (shape changed 2026-10-14): posts to the ``/inference/openai`` backend,
+  sends ``Authorization: Bearer public``, claims the ``opencode/latest/<v>/cli``
+  User-Agent, sends ``x-opencode-session`` + ``x-opencode-session-id`` (and
+  never the legacy ``x-opencode-request``), forces streaming with
+  ``stream_options.include_usage``, and makes the tool list read as an official
+  OpenCode agent session: every recognised tool carries its genuine
+  description/schema (a stub is rejected with 403 FreeTierError) and the
+  missing core tools (shell/edit/glob/grep/read) are appended.
 
 Usage
 -----
@@ -41,14 +46,334 @@ CLINE_HOST = "api.cline.bot"
 CLINE_PATH = "/api/v1/chat/completions"
 
 ZEN_HOST = "opencode.ai"
-ZEN_UA = "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14"
+# 2026-10-14: chat traffic moved off the legacy console origin to the inference backend.
+ZEN_CHAT_PATH = "/inference/openai/v1/chat/completions"
+ZEN_RESPONSES_PATH = "/inference/openai/v1/responses"
+# Gate shape: "opencode/<channel>/<version>/<name>" (the old
+# "opencode/<version> (<os> <arch>; <runtime>)" form now 403s).
+ZEN_UA = "opencode/latest/2.0.29/cli"
+# Anonymous credential is the literal token "public" (case-sensitive; absent header now 403s).
+ZEN_AUTH = "Bearer public"
+# Canonical session id: "ses_" + descending-time hex (low digits read ffe) + 14 base62.
 ZEN_SESSION = "ses_f4df4cb3bffetj5bTDp2vZHLRH"
-ZEN_REQUEST_ID = "msg_0b20bce72001HhNaOVex180aKz"
-ZEN_RESPONSES_PATH = "/zen/v1/responses"
+# Tool names the free tier expects on an agent session; genuine definitions required.
+ZEN_CORE_TOOLS = ("shell", "edit", "glob", "grep", "read")
 RESPONSES_MODEL_PREFIXES = ("muse-",)
-PLACEHOLDER_DESC = "Placeholder tool required by upstream gateway. Never invoke this tool."
+ZEN_TOOLS_JSON = r'''{
+  "edit": {
+    "description": "Edit the contents of a file by finding and replacing exact text. When editing text from Read output, preserve the exact indentation (tabs or spaces) and omit the line-number prefix, such as `1: `. Never include the prefix in oldString or newString. Write line breaks as \\n; the file's existing CRLF or LF line endings are matched and preserved. To change line endings themselves, make oldString and newString differ only in \\r; that edit applies to the exact bytes. If there is no exact match, the edit retries while ignoring typographic quote, dash, and space variants, then trailing whitespace on each line. The edit fails if oldString is not found. By default, oldString must identify a UNIQUE location. Multiple matches FAIL unless replaceAll is true. Add more surrounding context to disambiguate, or set replaceAll to true to replace every occurrence. Use replaceAll when the change should apply to every occurrence, such as renaming a variable.",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "newString": {
+          "description": "Text to replace oldString with (must differ from oldString)",
+          "type": "string"
+        },
+        "oldString": {
+          "description": "Exact text to find and replace",
+          "type": "string"
+        },
+        "path": {
+          "description": "File to edit",
+          "type": "string"
+        },
+        "replaceAll": {
+          "description": "Whether to replace every occurrence of oldString. When false, oldString must match exactly once. Defaults to false.",
+          "type": "boolean"
+        }
+      },
+      "required": ["path", "oldString", "newString"],
+      "type": "object"
+    }
+  },
+  "execute": {
+    "description": "Run JavaScript in a confined Code Mode runtime to script tool calls and HTTP requests and compose their results.\n`fetch` is available for HTTP requests. Imports, direct filesystem access, and timers are unavailable; all other external access goes through `tools`.\nWithin `{ code }`, the only callable tools are those explicitly listed in the Code Mode catalog instructions or returned by the `search` function. Inside `{ code }`, ignore tools shown outside the Code Mode catalog. They are not available in the Code Mode runtime.\nCall tools through `tools` using only exact paths and signatures from the catalog. Do not infer or normalize tool names; preserve bracket notation such as `tools.<namespace>[\"tool-name\"](input)`.\nPrefer an explicit `return`; if omitted, the final top-level expression becomes the result.\nAwait every call whose completion matters; pending calls are interrupted when execution ends. Run independent calls concurrently with `Promise.allSettled`.",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string"
+        }
+      },
+      "required": ["code"],
+      "type": "object"
+    }
+  },
+  "glob": {
+    "description": "Search file paths using a glob pattern (examples: \"**/*.ts\", \"src/**/*.tsx\").",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "hidden": {
+          "description": "Include hidden files and directories (default: false).",
+          "type": "boolean"
+        },
+        "limit": {
+          "description": "Maximum number of matching files to return (default: 100)",
+          "exclusiveMinimum": 0,
+          "type": "integer"
+        },
+        "path": {
+          "description": "Directory to search. Defaults to the current working directory.",
+          "type": "string"
+        },
+        "pattern": {
+          "description": "Glob pattern to match files against",
+          "type": "string"
+        }
+      },
+      "required": ["pattern"],
+      "type": "object"
+    }
+  },
+  "grep": {
+    "description": "Search file contents using ripgrep's regular expression syntax or literal text matching. Use it to locate specific code, symbols, or text patterns, and narrow searches with `path` or `include`. Returns matching file paths, line numbers, and line previews.",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "caseSensitive": {
+          "description": "Use case-sensitive matching (default: true).",
+          "type": "boolean"
+        },
+        "include": {
+          "description": "Glob pattern to filter files (for example, \"*.js\" or \"*.{ts,tsx}\")",
+          "type": "string"
+        },
+        "limit": {
+          "description": "Maximum number of matching lines to return (default: 100)",
+          "exclusiveMinimum": 0,
+          "type": "integer"
+        },
+        "literal": {
+          "description": "Treat `pattern` as exact text instead of a regular expression (default: false).",
+          "type": "boolean"
+        },
+        "path": {
+          "description": "File or directory to search. Defaults to the current working directory.",
+          "type": "string"
+        },
+        "pattern": {
+          "description": "Regular expression or literal text to match in file contents.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": ["pattern"],
+      "type": "object"
+    }
+  },
+  "question": {
+    "description": "Use this tool when you need to ask the user questions during execution. This allows you to:\n1. Gather user preferences or requirements\n2. Clarify ambiguous instructions\n3. Get decisions on implementation choices as you work\n4. Offer choices to the user about what direction to take.\n\nUsage notes:\n- A \"Type your own answer\" option is added automatically; don't include a separate option for free form answers\n- Set `multiple: true` to allow selecting more than one option\n- If you recommend a specific option, make that the first option in the list and add \"(Recommended)\" at the end of the label",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "questions": {
+          "description": "Questions to ask",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "header": {
+                "description": "Very short label (max 30 chars)",
+                "type": "string"
+              },
+              "multiple": {
+                "type": "boolean"
+              },
+              "options": {
+                "description": "Available choices",
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "description": {
+                      "description": "Explanation of choice",
+                      "type": "string"
+                    },
+                    "label": {
+                      "description": "Display text (1-5 words, concise)",
+                      "type": "string"
+                    }
+                  },
+                  "required": ["label", "description"],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "question": {
+                "description": "Complete question",
+                "type": "string"
+              }
+            },
+            "required": ["question", "header", "options"],
+            "type": "object"
+          },
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": ["questions"],
+      "type": "object"
+    }
+  },
+  "read": {
+    "description": "Read the contents of a file or directory. Supports text files, images, and PDFs. Images and PDFs are presented directly to the model. Each text line is prefixed by its 1-based line number as <line>: <content>. The prefix is for reference and is not part of the file content. Directory entries are returned one per line. Use offset and limit to read large files or directories in sections. Prefer one larger read over many small slices, and use grep to find specific content in large files.",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "description": "The maximum number of lines or directory entries to read (defaults to and capped at 2000)",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "offset": {
+          "description": "The line or directory entry to start reading from (1-based)",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "path": {
+          "description": "File or directory to read",
+          "type": "string"
+        }
+      },
+      "required": ["path"],
+      "type": "object"
+    }
+  },
+  "shell": {
+    "description": "Execute a shell command and return its output. Commands run on Windows using powershell. Quote file paths containing spaces or special characters. Prefer dedicated tools over shell commands when possible. When output is large, the full result is saved to a file and a truncated preview is returned. Rely on automatic truncation unless filtering the output is more useful. Commands accept an optional timeout, background commands have no timeout by default. Background commands return immediately, and you will be notified when they complete.",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "background": {
+          "description": "Run the command in the background and return immediately (useful for dev servers and long-running builds). You do not need to use '&' at the end of the command when using this parameter. You will be notified when it completes. DO NOT poll for completion.",
+          "type": "boolean"
+        },
+        "command": {
+          "description": "Shell command string to execute",
+          "type": "string"
+        },
+        "timeout": {
+          "description": "Timeout in milliseconds. Set to 0 to disable the timeout. Defaults to 120000 for foreground commands. Background commands have no timeout by default.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "workdir": {
+          "description": "Working directory to execute the command in. Defaults to the current working directory. When possible, avoid changing directories in the command and set the working directory here instead.",
+          "type": "string"
+        }
+      },
+      "required": ["command"],
+      "type": "object"
+    }
+  },
+  "skill": {
+    "description": "Load a specialized skill's instructions and resources into the current conversation when the task at hand matches its description.\n\nThe skill ID must match an available skill or a skill explicitly referenced by the user.",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "description": "The ID of an available skill or a skill explicitly referenced by the user",
+          "type": "string"
+        }
+      },
+      "required": ["id"],
+      "type": "object"
+    }
+  },
+  "subagent": {
+    "description": "Spawns an agent in a child session to work on the specified task.\nThe output includes a sessionID you can pass back later to continue that specific conversation with the subagent.\nNew child sessions start with fresh context, so include all relevant context and instructions when you don't pass a sessionID.\nForeground (default) runs the subagent to completion and returns its final response.\nBackground mode (background=true) launches it asynchronously and returns immediately; you are notified when it finishes.\nUse background only for independent work that can run while you continue elsewhere.\n\nAvailable subagents:\n- explore: Fast agent specialized for exploring codebases. Use this when you need to quickly find files by patterns (eg. \"src/components/**/*.tsx\"), search code for keywords (eg. \"API endpoints\"), or answer questions about the codebase (eg. \"how do API endpoints work?\"). When calling this agent, specify the desired thoroughness level: \"quick\" for basic searches, \"medium\" for moderate exploration, or \"very thorough\" for comprehensive analysis across multiple locations and naming conventions.\n- general: General-purpose agent for researching complex questions and executing multi-step tasks. Use this agent to execute multiple units of work in parallel.",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "agent": {
+          "description": "The type of specialized agent to use for this task. If the user asks for a subagent by a name that is not one of the available subagents, they most likely mean a model: pick a suitable agent and pass the name through the model parameter instead.",
+          "type": "string"
+        },
+        "background": {
+          "description": "Run the subagent in the background and return immediately. You will be notified when it completes. DO NOT sleep, poll, or proactively check on its progress.",
+          "type": "boolean"
+        },
+        "description": {
+          "description": "A short 3-5 word label for the task, displayed to the user",
+          "type": "string"
+        },
+        "model": {
+          "description": "NEVER set this unless the user explicitly asks for a particular model or variant. The value is written as \"providerID/modelID\", or \"providerID/modelID#variant\" to include a variant. Do not guess the ID: look the model up with the models tool, filtering to your own provider first.",
+          "type": "string"
+        },
+        "prompt": {
+          "description": "The task for the subagent to perform",
+          "type": "string"
+        },
+        "sessionID": {
+          "description": "Continue a specific previous subagent conversation by passing its sessionID. Calls without a sessionID start a new conversation.",
+          "pattern": "^ses",
+          "type": "string"
+        }
+      },
+      "required": ["agent", "description", "prompt"],
+      "type": "object"
+    }
+  },
+  "webfetch": {
+    "description": "Fetch content from an HTTP or HTTPS URL and return it as text, markdown, or HTML. Markdown is the default.\n\nUse a more targeted tool when one is available. This tool is read-only. Large text results may be replaced with a preview while the complete output is retained in managed storage.",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "format": {
+          "description": "The format to return the content in. Defaults to markdown.",
+          "enum": ["text", "markdown", "html"],
+          "type": "string"
+        },
+        "timeout": {
+          "description": "Optional timeout in seconds (maximum: 120)",
+          "exclusiveMinimum": 0,
+          "maximum": 120,
+          "type": "number"
+        },
+        "url": {
+          "description": "The HTTP or HTTPS URL to fetch content from",
+          "type": "string"
+        }
+      },
+      "required": ["url"],
+      "type": "object"
+    }
+  },
+  "websearch": {
+    "description": "Search the web using the user's selected search integration. Use this for current information beyond knowledge cutoff.\n\nThe current year is 2026. Use this year when searching for recent information or current events.",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "query": {
+          "description": "Websearch query",
+          "type": "string"
+        }
+      },
+      "required": ["query"],
+      "type": "object"
+    }
+  },
+  "write": {
+    "description": "Writes a file to the local filesystem, overwriting if one exists.\n\nMissing parent directories are created automatically.\n\nUse this tool to create new files or overwrite existing files. For partial changes, use the edit tool instead.",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "description": "Content to write to the file",
+          "type": "string"
+        },
+        "path": {
+          "description": "Path to the file to write to",
+          "type": "string"
+        }
+      },
+      "required": ["path", "content"],
+      "type": "object"
+    }
+  }
+}'''
 
-UPSTREAM_TIMEOUT = 300
+UPSTREAM_TIMEOUT = 600
 HOP_BY_HOP = ("host", "content-length", "transfer-encoding", "connection",
               "accept-encoding", "te", "trailer", "upgrade")
 
@@ -69,26 +394,74 @@ def _tool_names(payload):
     return names
 
 
+_ZEN_DEFS = json.loads(ZEN_TOOLS_JSON)
+
+
+def _chat_tool(name, definition):
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": definition.get("description") or ("Agent tool " + name),
+            "parameters": definition.get("parameters") or {"type": "object", "properties": {}},
+        },
+    }
+
+
 def _ensure_zen_tools(payload):
+    """Make the tool list read as an official OpenCode agent session.
+
+    The 2026-10-14 gate validates the genuine description/schema of every tool
+    name it recognises, so same-named client tools are rewritten to the official
+    definition and the missing core tools are appended.
+    """
     tools = payload.get("tools")
     if not isinstance(tools, list):
         tools = []
-    names = _tool_names(payload)
-    added = []
-    for name in ("bash", "read"):
-        if name not in names:
+    fixed, added, seen = [], [], set()
+    for tool in tools:
+        fn = tool.get("function") if isinstance(tool, dict) else None
+        name = fn.get("name") if isinstance(fn, dict) else None
+        if name and name in _ZEN_DEFS:
+            fn["description"] = _ZEN_DEFS[name].get("description") or fn.get("description")
+            fn["parameters"] = _ZEN_DEFS[name].get("parameters") or fn.get("parameters")
+        if name:
+            seen.add(name)
+        fixed.append(tool)
+    for name in ZEN_CORE_TOOLS:
+        if name not in seen and name in _ZEN_DEFS:
+            fixed.append(_chat_tool(name, _ZEN_DEFS[name]))
+            added.append(name)
+    payload["tools"] = fixed
+    return added
+
+
+def _zen_tools_for_responses(payload):
+    """Same shaping for the Responses protocol (muse-* models)."""
+    tools, seen = [], set()
+    for tool in payload.get("tools") or []:
+        fn = tool.get("function") if isinstance(tool, dict) else None
+        name = fn.get("name") if isinstance(fn, dict) else None
+        if not name:
+            continue
+        definition = _ZEN_DEFS.get(name) or {}
+        tools.append({
+            "type": "function",
+            "name": name,
+            "description": definition.get("description") or fn.get("description") or "",
+            "parameters": definition.get("parameters") or fn.get("parameters")
+            or {"type": "object", "properties": {}},
+        })
+        seen.add(name)
+    for name in ZEN_CORE_TOOLS:
+        if name not in seen and name in _ZEN_DEFS:
             tools.append({
                 "type": "function",
-                "function": {
-                    "name": name,
-                    "description": PLACEHOLDER_DESC,
-                    "parameters": {"type": "object", "properties": {}, "required": []},
-                },
+                "name": name,
+                "description": _ZEN_DEFS[name].get("description") or "",
+                "parameters": _ZEN_DEFS[name].get("parameters") or {"type": "object", "properties": {}},
             })
-            added.append(name)
-    if tools:
-        payload["tools"] = tools
-    return added
+    return tools
 
 
 def _map_chunk(data):
@@ -224,6 +597,9 @@ def _chat_to_responses(payload):
         out["instructions"] = "\n\n".join(instructions)
     out["input"] = inputs
     out["store"] = False
+    tools = _zen_tools_for_responses(payload)
+    if tools:
+        out["tools"] = tools
     for src, dst in (("max_tokens", "max_output_tokens"),
                      ("temperature", "temperature"),
                      ("top_p", "top_p"),
@@ -232,26 +608,8 @@ def _chat_to_responses(payload):
             out[dst] = payload[src]
     if isinstance(payload.get("tool_choice"), str):
         out["tool_choice"] = payload["tool_choice"]
-
-    tools = []
-    names = set()
-    for tool in payload.get("tools") or []:
-        fn = tool.get("function") or {}
-        name = fn.get("name")
-        if not name:
-            continue
-        tools.append({"type": "function", "name": name,
-                      "description": fn.get("description") or "",
-                      "parameters": fn.get("parameters") or {"type": "object", "properties": {}}})
-        names.add(name)
-    added = []
-    for name in ("bash", "read"):
-        if name not in names:
-            tools.append({"type": "function", "name": name,
-                          "description": PLACEHOLDER_DESC,
-                          "parameters": {"type": "object", "properties": {}, "required": []}})
-            added.append(name)
-    out["tools"] = tools
+    added = [name for name in ZEN_CORE_TOOLS
+             if name not in {t.get("name") for t in tools}]
     return out, added
 
 
@@ -388,7 +746,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _route(self):
         path = self.path.split("?", 1)[0].rstrip("/")
         if path == "/zen/v1/chat/completions":
-            return "zen", ZEN_HOST, self.path
+            return "zen", ZEN_HOST, ZEN_CHAT_PATH
         if path.endswith("/chat/completions"):
             return "cline", CLINE_HOST, CLINE_PATH
         return None, None, None
@@ -437,6 +795,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 else:
                     added = _ensure_zen_tools(payload)
                     payload["stream"] = True
+                    options = payload.get("stream_options")
+                    if not isinstance(options, dict):
+                        options = {}
+                    if options.get("include_usage") is not True:
+                        options["include_usage"] = True
+                    payload["stream_options"] = options
                     n_tools = len(payload.get("tools") or [])
                     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             else:
@@ -460,11 +824,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             headers = {
                 "Content-Type": "application/json",
                 "Accept": "text/event-stream",
+                "Authorization": ZEN_AUTH,
                 "User-Agent": ZEN_UA,
                 "x-opencode-client": "cli",
                 "x-opencode-project": "global",
                 "x-opencode-session": ZEN_SESSION,
-                "x-opencode-request": ZEN_REQUEST_ID,
+                "x-opencode-session-id": ZEN_SESSION,
                 "x-session-affinity": ZEN_SESSION,
                 "X-Session-Id": ZEN_SESSION,
                 "Accept-Encoding": "identity",
