@@ -49,6 +49,14 @@ Stdlib only — no dependencies. Python ≥ 3.8.
 ## Quick start
 
 ```bash
+# loopback only (default)
+python3 sse_map_proxy.py --port 3457
+
+# bind several addresses at once (repeatable) — recommended for host + container use:
+#   docker bridge + loopback only, never the public interface
+python3 sse_map_proxy.py --bind 172.18.0.1 --bind 127.0.0.1 --port 3457
+
+# legacy: bind every interface (0.0.0.0). Only for trusted networks.
 python3 sse_map_proxy.py --host --port 3457
 ```
 
@@ -56,6 +64,10 @@ Point any OpenAI-compatible client at:
 
 - cline route: `http://127.0.0.1:3457/v1`
 - zen route:   `http://127.0.0.1:3457/zen/v1`
+
+> ⚠️ This proxy has **no authentication** — it will happily relay requests with
+> the credentials it holds. Never expose it on a public interface: bind the
+> docker bridge IP (so CPA containers can reach it) plus loopback, not `0.0.0.0`.
 
 ### systemd
 
@@ -65,7 +77,7 @@ Description=sse-map-proxy
 After=network-online.target
 
 [Service]
-ExecStart=/usr/bin/python3 /root/sse_map_proxy.py --host --port 3457
+ExecStart=/usr/bin/python3 /root/sse_map_proxy.py --bind 172.18.0.1 --bind 127.0.0.1 --port 3457
 Restart=always
 RestartSec=3
 StandardOutput=append:/var/log/sse-map-proxy.log
@@ -78,6 +90,7 @@ WantedBy=multi-user.target
 ```bash
 systemctl daemon-reload && systemctl enable --now sse-map-proxy
 curl -s http://127.0.0.1:3457/health
+ss -ltnp | grep 3457      # must NOT show 0.0.0.0
 ```
 
 ## Notes on the zen free tier
@@ -113,6 +126,13 @@ The injected `shell` / `edit` / `glob` / `grep` / `read` tools are the genuine
 OpenCode definitions, not stubs. A model may still decide to *emit* a tool call
 for them; most non-OpenCode clients have no executor for those names. Use the
 zen route for chat-style traffic.
+
+## Options
+
+- `--port N` listen port (default `3457`).
+- `--bind ADDR` bind address, repeatable (default loopback only). Use it to bind
+  the docker bridge **and** loopback, e.g. `--bind 172.18.0.1 --bind 127.0.0.1`.
+- `--host` legacy switch, equivalent to `--bind 0.0.0.0`.
 
 ## Debugging
 

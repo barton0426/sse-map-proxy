@@ -40,6 +40,7 @@ import json
 import os
 import ssl
 import sys
+import threading
 import time
 
 CLINE_HOST = "api.cline.bot"
@@ -994,17 +995,30 @@ def main():
     parser = argparse.ArgumentParser(description="sse-map-proxy")
     parser.add_argument("--host", action="store_true",
                         help="bind 0.0.0.0 instead of 127.0.0.1")
+    parser.add_argument("--bind", action="append", default=None, metavar="ADDR",
+                        help="bind address (repeatable). Overrides --host. "
+                             "e.g. --bind 172.18.0.1 --bind 127.0.0.1 "
+                             "(docker bridge + loopback only, NOT the public IP)")
     parser.add_argument("--port", type=int, default=3457)
     parser.add_argument("--dump-dir", default=None,
                         help="write the last upstream request body to this directory")
     args = parser.parse_args()
 
     Handler.dump_dir = args.dump_dir
-    bound = "0.0.0.0" if args.host else "127.0.0.1"
-    httpd = Server((bound, args.port), Handler)
-    print("sse-map-proxy on %s:%d  (cline: /v1/... -> %s, zen: /zen/v1/... -> %s)" % (
-        bound, args.port, CLINE_HOST, ZEN_HOST))
-    httpd.serve_forever()
+    if args.bind:
+        binds = list(dict.fromkeys(args.bind))          # de-dup, keep order
+    else:
+        binds = ["0.0.0.0"] if args.host else ["127.0.0.1"]
+
+    servers = []
+    for addr in binds:
+        servers.append((addr, Server((addr, args.port), Handler)))
+    print("sse-map-proxy on %s  (cline: /v1/... -> %s, zen: /zen/v1/... -> %s)" % (
+        ", ".join("%s:%d" % (a, args.port) for a, _ in servers), CLINE_HOST, ZEN_HOST))
+    sys.stdout.flush()
+    for _, srv in servers[1:]:
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    servers[0][1].serve_forever()
 
 
 if __name__ == "__main__":
